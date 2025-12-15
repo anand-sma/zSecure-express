@@ -1,20 +1,29 @@
 # 🛡️ zSecure-Express - Ultimate Security for Node.js
 
-[![npm version](https://img.shields.io/npm/v/zsecure-express)](https://www.npmjs.com/package/zsecure-express)
-[![security](https://img.shields.io/badge/security-enterprise-blue)](https://zsecure.dev)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![npm version](https://img.shields.io/npm/v/zsecure-express?style=flat-square)](https://www.npmjs.com/package/zsecure-express)
+[![security](https://img.shields.io/badge/security-enterprise--grade-blue?style=flat-square)](https://zsecure.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue?style=flat-square&logo=typescript)](https://www.typescriptlang.org/)
 
 **One-line security for your Express apps. Enterprise-grade protection made simple.**
 
+zSecure-Express is a comprehensive security middleware suite designed to protect your Node.js/Express applications against a wide range of cyber threats. It combines industry-standard best practices with advanced features like AI-powered anomaly detection and active deception (honeypots).
+
+---
+
 ## ✨ Features
 
-✅ **23+ Security Layers** - More than any other package  
-✅ **Auto Honeypot** - Deceptive security that catches hackers  
-✅ **Threat Intelligence** - Real-time IP reputation checks  
-✅ **AI Anomaly Detection** - Machine learning powered protection  
-✅ **Zero Configuration** - Works out of the box  
-✅ **TypeScript Ready** - Full TypeScript support  
-✅ **Production Ready** - Battle-tested in enterprise
+| Feature                     | Description                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------- |
+| **🛡️ Core Protection**      | Advanced Helmet Headers, CORS, CSRF, and Rate Limiting.                         |
+| **🧠 AI Anomaly Detection** | Machine learning powered analysis to detect unusual traffic patterns.           |
+| **🍯 Auto Honeypot**        | Deceptive endpoints (e.g., `/wp-admin`, `/.env`) that trap and block attackers. |
+| **🌍 Threat Intelligence**  | Real-time IP reputation checks against known banlists (AbuseIPDB, VirusTotal).  |
+| **💉 Injection Prevention** | Automatic protection against XSS and SQL Injection attacks.                     |
+| **🔌 Plugin System**        | Extensible architecture with built-in WAF and Audit Log plugins.                |
+| **📜 Zero Config**          | Works effectively out of the box with smart defaults.                           |
+
+---
 
 ## 🚀 Installation
 
@@ -24,79 +33,176 @@ npm install zsecure-express express
 yarn add zsecure-express express
 ```
 
-# ⚡ 5-Second Setup
+---
 
-import express from 'express';
-import { secure } from 'zsecure-express';
+## ⚡ Quick Start
+
+Get full protection in just 5 seconds:
+
+```typescript
+import express from "express";
+import { secure } from "zsecure-express";
 
 const app = express();
 
-// One line = Full security 🎉
+// 🎉 One line = Full Security
 app.use(secure());
 
-app.get('/', (req, res) => {
-res.json({ message: 'I am secure!' });
+app.get("/", (req, res) => {
+  res.json({ message: "I am secure!" });
 });
 
-app.listen(3000);
+app.listen(3000, () => {
+  console.log("Server running on port 3000");
+});
+```
 
-# 🎯 Advanced Usage
+---
 
-## Preset Configurations
+## 🎯 Configuration Presets
 
-import { secure } from 'zsecure-express';
+zSecure comes with optimized presets for common use cases. You don't need to manually configure every option.
 
-## Choose from 6 presets
+```typescript
+import { secure, presets } from "zsecure-express";
 
-app.use(secure.preset('enterprise')); // Maximum security
-app.use(secure.preset('api')); // API-focused
-app.use(secure.preset('honeypot')); // Deception-focused
-app.use(secure.preset('ecommerce')); // PCI-compliant
+// 🏢 Enterprise: Maximum security, strict logging, full threat intel
+app.use(secure(presets.enterprise));
 
-# Custom Configuration
+// 🔌 API: Optimized for REST/GraphQL (CORS allowed, strict validation)
+app.use(secure(presets.api));
 
-app.use(secure({
-rateLimit: { max: 1000 },
-honeypot: { enabled: true },
-threatIntel: { providers: ['abuseipdb'] }
-}));
+// 🛍️ E-commerce: PCI-DSS compliant settings for sensitive transactions
+app.use(secure(presets.ecommerce));
 
-# Individual Middleware
+// 🍯 Honeypot: Aggressive deception to trap bots
+app.use(secure(presets.honeypot));
 
-import { helmet, rateLimit, honeywall } from 'zsecure-express';
+// 🛠️ Development: Relaxed rules for local testing
+app.use(secure(presets.development));
+```
 
-app.use(helmet());
-app.use(rateLimit());
-app.use(honeywall({ level: 'aggressive' }));
+---
 
-# 🔧 Configuration Options
+## 🔧 Custom Configuration
 
-Option Type Default Description
-helmet boolean/object true Advanced security headers
-rateLimit boolean/object true Smart rate limiting
-honeypot boolean/object false Deceptive endpoints
-threatIntel boolean/object false IP reputation checks
-anomalyDetection boolean/object false ML-powered detection
-logging.audit boolean false Security audit logs
+You can override any preset or configure individual modules manually.
 
-# 📊 Monitoring
+```typescript
+app.use(
+  secure({
+    // Core Modules
+    rateLimit: {
+      windowMs: 15 * 60 * 1000,
+      max: 100,
+    },
 
-import { securityMetrics } from 'zsecure-express';
+    // Advanced Modules
+    threatIntel: {
+      enabled: true,
+      providers: ["abuseipdb"],
+    },
 
-// Get real-time security metrics
-app.get('/security/metrics', (req, res) => {
-res.json(securityMetrics.get());
+    // Deception
+    honeypot: {
+      enabled: true,
+      endpoints: ["/admin", "/private"],
+    },
+
+    // AI Protection
+    anomalyDetection: {
+      enabled: true,
+      sensitivity: "high",
+    },
+  })
+);
+```
+
+---
+
+## 🧩 Modular Usage
+
+If you prefer to use specific middlewares instead of the all-in-one wrapper:
+
+```typescript
+import { helmet, rateLimit, honeywall, xss } from "zsecure-express";
+
+const app = express();
+
+app.use(helmet()); // Secure Headers
+app.use(xss()); // XSS Protection
+app.use(rateLimit()); // Rate Limiting
+app.use(honeywall()); // Honeypot Protection
+```
+
+---
+
+## 🛠️ Utilities & Plugins
+
+zSecure includes helpful utilities and a plugin system for extending functionality.
+
+### Encryption Helper
+
+```typescript
+import { encryption } from "zsecure-express";
+
+const secret = encryption.encrypt("my-secret-data");
+const original = encryption.decrypt(secret);
+```
+
+### Enhanced JWT
+
+```typescript
+import { jwt } from "zsecure-express";
+
+const token = await jwt.sign({ userId: 123 });
+const payload = await jwt.verify(token);
+```
+
+### Plugins
+
+```typescript
+import { secure, SimpleWafPlugin, AuditLogPlugin } from "zsecure-express";
+
+const security = secure();
+
+// Block common malicious patterns
+security.use(new SimpleWafPlugin());
+
+// Log all security events
+security.use(new AuditLogPlugin({ storage: "file" }));
+
+app.use(security);
+```
+
+---
+
+## 📊 Monitoring
+
+Access real-time security insights directly from your app.
+
+```typescript
+import { securityMetrics, honeywall } from "zsecure-express";
+
+// View general security stats
+app.get("/admin/security/stats", (req, res) => {
+  res.json(securityMetrics.get());
 });
 
-// View honeypot interactions
-app.get('/security/honeypot', (req, res) => {
-res.json(honeywall.getInteractions());
+// See who fell for the honeypot
+app.get("/admin/security/trapped", (req, res) => {
+  res.json(honeywall.getInteractions());
 });
+```
 
-# 📄 License
+---
 
-MIT © ZSecure Team
+## 📄 License
 
-# ⚠️ Disclaimer
+MIT © [ZSecure Team](https://zsecure.dev)
 
-This package provides security layers but doesn't guarantee complete protection. Always follow security best practices.
+---
+
+## ⚠️ Disclaimer
+
+While **zSecure-Express** provides extensive security layers, no software offers 100% protection. Always follow security best practices, keep your dependencies updated, and perform regular audits.
