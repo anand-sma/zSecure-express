@@ -188,7 +188,7 @@ export class ThreatIntelEngine {
     // 3. Query Providers
     // We aggregate scores. Since we want "aggressively defensive", we take the MAX score found.
     let maxScore = 0;
-    let combinedTags: string[] = [];
+    const combinedTags: string[] = [];
     let detectedSource = 'none';
 
     if (this.options.providers) {

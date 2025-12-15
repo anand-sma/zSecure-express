@@ -47,7 +47,7 @@ export function createSQLInjectionMiddleware(options: SQLInjectionOptions = {}) 
 
   // Level 'low': Obvious destructive commands and comments
   const lowRiskPatterns = [
-    /(\%27)|(\')|(\-\-)|(\%23)|(#)/i,           // Single quote, double dash, hash
+    /(%27)|(')|(--)|(%23)|(#)/i,           // Single quote, double dash, hash
     /(\/\*)|(\*\/)/i,                            // Comment blocks
     /(;)\s*(DROP|ALTER|CREATE|DELETE|UPDATE|INSERT)/i // Chained destructive commands
   ];

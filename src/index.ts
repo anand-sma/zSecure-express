@@ -116,7 +116,7 @@ export {
   createAnomalyDetectionMiddleware as anomalyDetection, 
   type AnomalyOptions, 
   type AnomalyLogger, 
-  type ClientState 
+  type ClientProfile 
 } from './middleware/advanced/anomaly-detection';
 
 // ============================================================================

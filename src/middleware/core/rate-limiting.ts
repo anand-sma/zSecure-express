@@ -163,7 +163,7 @@ export function createRateLimitMiddleware(options: RateLimitOptions = {}) {
       const key = generateKey(req);
       const now = Date.now();
       
-      let record = await getRecord(key);
+      const record = await getRecord(key);
 
       // 1. Check if Banned
       if (record.bannedUntil && record.bannedUntil > now) {
