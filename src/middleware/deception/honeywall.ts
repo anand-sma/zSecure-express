@@ -1,11 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import { faker } from '@faker-js/faker';
+import { logger } from '../../utils/logger';
 
-export interface HoneywallLogger {
-  warn(message: string, meta?: any): void;
-  info(message: string, meta?: any): void;
-  error(message: string, meta?: any): void;
-}
+// --- Interfaces ---
 
 export interface HoneywallOptions {
   /**
@@ -32,10 +29,11 @@ export interface HoneywallOptions {
    * Response strategy for trapped requests.
    * 'hang': Keep connection open indefinitely (Tarpit).
    * 'fake-data': Return realistic fake credentials/data.
+   * 'fake-login': Return a fake HTML login page.
    * 'error': Return 403/404.
    * Default: 'fake-data'
    */
-  strategy?: 'hang' | 'fake-data' | 'error';
+  strategy?: 'hang' | 'fake-data' | 'fake-login' | 'error';
 
   /**
    * Delay in milliseconds before responding (to waste attacker time).
@@ -53,15 +51,7 @@ export interface HoneywallOptions {
    * Callback to execute when a honeypot is tripped (e.g., ban IP).
    */
   onTrip?: (req: Request, sourceIp: string) => void;
-
-  logger?: HoneywallLogger;
 }
-
-const defaultLogger: HoneywallLogger = {
-  warn: (msg, meta) => console.warn(`[HONEYWALL:WARN] ${msg}`, meta || ''),
-  info: (msg) => console.log(`[HONEYWALL:INFO] ${msg}`),
-  error: (msg, meta) => console.error(`[HONEYWALL:ERROR] ${msg}`, meta || '')
-};
 
 /**
  * Enterprise Honeywall Middleware (Deception & Defense)
@@ -69,13 +59,12 @@ const defaultLogger: HoneywallLogger = {
  * 1. Lures attackers into accessing fake sensitive endpoints.
  * 2. Wastes attacker time with Tarpit delays.
  * 3. Identifies scanners via Canary Tokens.
- * 4. Provides realistic fake data to confuse active recon.
+ * 4. Provides realistic fake data/login pages to confuse active recon.
  */
 export function createHoneypotMiddleware(options: HoneywallOptions = {}) {
-  const logger = options.logger || defaultLogger;
   const paths = new Set(options.honeypotPaths || [
     '/admin', '/wp-admin', '/phpmyadmin', '/.env', '/config.json',
-    '/backup.sql', '/.git/config', '/api/keys', '/id_rsa'
+    '/backup.sql', '/.git/config', '/api/keys', '/id_rsa', '/aws/credentials'
   ]);
   const patterns = options.honeypotPatterns || [];
   const strategy = options.strategy || 'fake-data';
@@ -85,7 +74,7 @@ export function createHoneypotMiddleware(options: HoneywallOptions = {}) {
   // Suspicious Agents (for medium/high sensitivity)
   const suspiciousAgents = [
     'sqlmap', 'nikto', 'nessus', 'metasploit', 'nmap', 'burpsuite', 
-    'wpscan', 'acunetix', 'zaproxy', 'havij'
+    'wpscan', 'acunetix', 'zaproxy', 'havij', 'masscan'
   ];
 
   const checkHoneypot = (req: Request): boolean => {
@@ -104,25 +93,63 @@ export function createHoneypotMiddleware(options: HoneywallOptions = {}) {
     return false;
   };
 
-  const generateFakeResponse = () => {
-    // Generate realistic looking dump
+  const generateFakeData = () => {
     return {
       status: 'success',
-      apiVersion: '3.4.1',
-      environment: 'production',
-      keys: Array.from({ length: 3 }, () => ({
-        id: faker.string.uuid(),
-        secret: `sk_live_${faker.string.alphanumeric(48)}`, // Stripe-like
-        role: 'full_access',
-        lastUsed: faker.date.recent().toISOString()
+      apiVersion: 'v4.1.0-alpha',
+      environment: 'production-eu-west',
+      maintenance_mode: false,
+      debug: true, // Lure
+      keys: Array.from({ length: 2 }, () => ({
+        key_id: faker.string.uuid(),
+        secret: `sk_prod_${faker.string.alphanumeric(48)}`,
+        acls: ['admin', 'write:all'],
+        created: faker.date.past().toISOString()
       })),
       database: {
-        host: 'db-prod-primary.internal',
+        host: '10.0.12.54', // Fake internal IP
         port: 5432,
-        user: 'postgres',
-        password_hash: faker.string.alphanumeric(64) // Not a real password
+        user: 'admin_readonly',
+        pass: faker.string.alphanumeric(16)
       }
     };
+  };
+
+  const generateFakeLogin = () => {
+      // Simple deceptive login page
+      return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+          <title>Admin Portal - Unauthorized Access Logged</title>
+          <style>
+            body { font-family: -apple-system, system-ui, sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+            .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 320px; }
+            h2 { margin-top: 0; color: #1a202c; }
+            input { width: 100%; padding: 0.5rem; margin: 0.5rem 0; border: 1px solid #e2e8f0; border-radius: 4px; }
+            button { width: 100%; padding: 0.5rem; background: #3182ce; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+            button:hover { background: #2c5282; }
+          </style>
+      </head>
+      <body>
+          <div class="card">
+              <h2>System Login</h2>
+              <p style="color:red; font-size: 0.9em;">Secure Environment. All actions monitored.</p>
+              <form method="POST" action="/login/authenticate">
+                  <div>
+                      <label>Username (SSO ID)</label>
+                      <input type="text" name="username" required>
+                  </div>
+                  <div>
+                      <label>Password</label>
+                      <input type="password" name="password" required>
+                  </div>
+                  <button type="submit">Sign In</button>
+              </form>
+          </div>
+      </body>
+      </html>
+      `;
   };
 
   return async (req: Request, res: Response, next: NextFunction) => {
@@ -131,7 +158,6 @@ export function createHoneypotMiddleware(options: HoneywallOptions = {}) {
       // Passive check: Did they provide a canary cookie?
       if (options.canaryCookie && req.cookies && req.cookies['__admin_session_v2']) {
          logger.warn(`Canary Token Tripped! IP ${req.ip} is reusing a decoy cookie.`);
-         // We treat this as a trip too
          if (options.onTrip) options.onTrip(req, req.ip || 'unknown');
          return res.status(403).send('Session Invalidated'); 
       }
@@ -140,32 +166,33 @@ export function createHoneypotMiddleware(options: HoneywallOptions = {}) {
 
     // --- TRAP TRIGGERED ---
     const ip = req.ip || req.socket.remoteAddress || 'unknown';
-    logger.warn(`Honeywall Trap Triggered: IP ${ip} accessed ${req.path}`);
+    logger.warn(`Honeywall Trap Triggered: IP ${ip} accessed ${req.path}`, {
+        method: req.method,
+        uas: req.headers['user-agent']
+    });
 
     // Execute Callback (e.g. IP Ban)
+    // We do this async to not block response if heavy
     if (options.onTrip) {
-      options.onTrip(req, ip as string);
+      setTimeout(() => options.onTrip!(req, ip as string), 0);
     }
 
-    // 1. Tarpit Strategy (Hang)
-    if (strategy === 'hang') {
-        // Just never reply? Or reply extremely slowly?
-        // Node might timeout, so let's just write slowly or wait long.
-        if (tarpitDelay > 0) {
-            await new Promise(resolve => setTimeout(resolve, tarpitDelay));
-        } else {
-             // Infinite-ish wait (until socket timeout)
-             // We won't resolve response.
-             return; 
-        }
-    }
-
-    // 2. Delay (even for other strategies)
-    if (tarpitDelay > 0 && strategy !== 'hang') {
+    // 1. Tarpit Strategy (Hang/Delay)
+    // Delay always applied if set, except for pure 'hang' which implies max delay
+    if (tarpitDelay > 0) {
         await new Promise(resolve => setTimeout(resolve, tarpitDelay));
     }
 
-    // 3. Canary Insertion
+    if (strategy === 'hang') {
+         // Keep open until client timeout or socket destruction
+         // Just return undefined to hang express? No, that leaks memory.
+         // Better to just not call next() and not send res, but eventually node timeouts.
+         // A very long delay is safer.
+         // Actually, let's just close the connection abruptly to confuse them.
+         return req.socket.destroy();
+    }
+
+    // 2. Canary Insertion
     if (options.canaryCookie) {
         res.cookie('__admin_session_v2', faker.string.alphanumeric(32), {
             httpOnly: true,
@@ -174,15 +201,29 @@ export function createHoneypotMiddleware(options: HoneywallOptions = {}) {
         });
     }
 
-    // 4. Response
+    // 3. Response Generation
+    // Fake headers to look like internal system
+    res.setHeader('X-Powered-By', 'Internal-System-v2');
+    res.setHeader('Server', 'Apache/2.4.41 (Ubuntu)');
+
     if (strategy === 'error') {
-        return res.status(404).send('Not Found'); // Pretend it doesn't exist
+        return res.status(404).send('Not Found'); 
+    }
+
+    if (strategy === 'fake-login') {
+         // If GET, show form. If POST, accept and redirect?
+         if (req.method === 'GET') {
+             res.status(200).send(generateFakeLogin());
+         } else {
+             // Fake success then redirect to same page or 403
+             res.status(200).send('<h1>MFA Token Required</h1><p>Please check your hardware token.</p>');
+         }
+         return;
     }
 
     if (strategy === 'fake-data') {
         res.setHeader('Content-Type', 'application/json');
-        res.setHeader('X-Server-Id', 'prod-worker-01'); // Fake header
-        return res.status(200).json(generateFakeResponse());
+        return res.status(200).json(generateFakeData());
     }
 
     next();

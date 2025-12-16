@@ -1,17 +1,13 @@
 import { Request, Response, NextFunction } from 'express';
+import { logger } from '../../utils/logger';
 
 // --- Interfaces ---
-
-export interface XSSLogger {
-  warn(message: string, meta?: any): void;
-  error(message: string, meta?: any): void;
-}
 
 export interface XSSOptions {
   /**
    * Mode of operation.
    * 'block': Abort request if XSS is detected. (Default)
-   * 'sanitize': Attempt to strip malicious content and continue.
+   * 'sanitize': Escape dangerous characters to HTML entities.
    */
   mode?: 'block' | 'sanitize';
 
@@ -19,169 +15,158 @@ export interface XSSOptions {
    * Keys to exclude from checking (e.g., 'html_content').
    */
   whitelist?: string[];
-
-  /**
-   * Custom logger.
-   */
-  logger?: XSSLogger;
 }
 
-// --- Default Console Logger ---
-const defaultLogger: XSSLogger = {
-  warn: (msg, meta) => console.warn(`[XSS:WARN] ${msg}`, meta || ''),
-  error: (msg, meta) => console.error(`[XSS:ERROR] ${msg}`, meta || '')
-};
-
 // --- Regex Definitions ---
-// Comprehensive patterns for XSS vectors
-const XSS_PATTERNS = [
-  /<script\b[^>]*>([\s\S]*?)<\/script>/gim,           // <script>...</script>
-  /javascript:[^"']*/gim,                              // javascript: protocol
-  /on\w+\s*=\s*("|')?[^"'>]+("|')?/gim,                // Event handlers (onload=, onerror=)
-  /data:text\/html/gim,                                // Data URIs
-  /vbscript:/gim,                                      // vbscript protocol
-  /<\s*iframe[^>]*>/gim,                               // iframes
-  /<\s*object[^>]*>/gim,                               // Objects
-  /<\s*embed[^>]*>/gim,                                // Embeds
-  /<\s*style[^>]*>/gim                                 // Style injections
+// Characters that trigger encoding/blocking
+// < > " ' / `
+const DANGEROUS_CHARS = /[<>"'/`]/g;
+
+// Patterns that almost certainly indicate an attack (for blocking mode)
+const BLOCK_PATTERNS = [
+  /javascript:/i,
+  /vbscript:/i,
+  /data:text\/html/i,
+  /onload\s*=/i,
+  /onerror\s*=/i,
+  /onclick\s*=/i,
+  /<script/i,
+  /<iframe/i,
+  /<object/i,
+  /<embed/i
 ];
 
 /**
  * XSS Protection Middleware
  * 
- * Scans request body, query, and params for XSS vectors.
- * Can be configured to BLOCK requests or SANITIZE inputs.
+ * Protects against Reflected and Stored XSS by either:
+ * 1. Blocking requests containing dangerous XSS vectors.
+ * 2. Sanitizing inputs by encoding HTML entities (Input Hygiene).
  */
 export function createXSSMiddleware(options: XSSOptions = {}) {
-  const logger = options.logger || defaultLogger;
   const whitelist = new Set(options.whitelist || []);
   const mode = options.mode || 'block';
 
-  // Helper: Check string for XSS
-  const detectXSS = (str: string): boolean => {
-    return XSS_PATTERNS.some(pattern => pattern.test(str));
+  // Helper: Encode HTML Entities
+  const encode = (str: string): string => {
+    return str.replace(DANGEROUS_CHARS, (char) => {
+      switch (char) {
+        case '<': return '&lt;';
+        case '>': return '&gt;';
+        case '"': return '&quot;';
+        case "'": return '&#x27;';
+        case '/': return '&#x2F;';
+        case '`': return '&#96;';
+        default: return char;
+      }
+    });
   };
 
-  // Helper: Sanitize string (Basic stipping)
-  const sanitizeString = (str: string): string => {
-    let sanitized = str;
-    XSS_PATTERNS.forEach(pattern => {
-      sanitized = sanitized.replace(pattern, '[REMOVED_XSS]');
-    });
-    return sanitized;
+  // Helper: Detect Blocking Checks
+  const hasAttackVector = (str: string): boolean => {
+    // 1. Check for dangerous characters if in strict mode? 
+    // Actually blocking every < or > is too aggressive for some apps, but standard for high security JSON apis.
+    // Let's use the explicit block patterns for less false positives, 
+    // OR if tight security, block any <script tag.
+    return BLOCK_PATTERNS.some(p => p.test(str));
   };
 
   /**
-   * Recursive Scanner/Sanitizer
-   * Returns:
-   *   - If mode='block': boolean (true if malicious)
-   *   - If mode='sanitize': number (count of sanitized fields - *mutates input*)
+   * Recursive Processor
    */
   const processPayload = (input: any, keyName: string = ''): boolean | number => {
     if (whitelist.has(keyName)) return mode === 'block' ? false : 0;
 
     if (typeof input === 'string') {
-      if (detectXSS(input)) {
-        if (mode === 'block') return true; // Block immediately
-        // Sanitize logic is tricky because we can't easily mutate the string in specific nested position 
-        // without returning it. This simplifed logic assumes we update via reference if object, 
-        // but for string passed directly, we can't. 
-        // Actually, for robust sanitization of deep objects, we need to return the new value.
-        // But for 'check', returning boolean is enough.
-        return 1; 
+      if (mode === 'block') {
+        if (hasAttackVector(input)) return true;
+      } else {
+        // Sanitize: Encode dangerous chars
+        // We can't mutate primitives passed by value here, done in parent loop
+        // But for return value count, we verify if it needs changing
+        if (DANGEROUS_CHARS.test(input)) return 1;
       }
-      return mode === 'block' ? false : 0;
+      return false; 
     }
 
     if (Array.isArray(input)) {
       if (mode === 'block') {
-        return input.some(item => processPayload(item, keyName));
+         return input.some(item => processPayload(item, keyName));
       } else {
-        // Sanitization in place for arrays
-        let sanitizedCount = 0;
-        for (let i = 0; i < input.length; i++) {
-          if (typeof input[i] === 'string') {
-             if (detectXSS(input[i])) {
-                input[i] = sanitizeString(input[i]);
-                sanitizedCount++;
-             }
-          } else {
-             sanitizedCount += (processPayload(input[i], keyName) as number);
-          }
-        }
-        return sanitizedCount;
+         let count = 0;
+         for (let i = 0; i < input.length; i++) {
+            const item = input[i];
+            if (typeof item === 'string') {
+               if (DANGEROUS_CHARS.test(item)) {
+                  input[i] = encode(item);
+                  count++;
+               }
+            } else {
+               count += (processPayload(item, keyName) as number);
+            }
+         }
+         return count;
       }
     }
 
     if (input && typeof input === 'object') {
-      if (mode === 'block') {
-        return Object.keys(input).some(key => processPayload(input[key], key));
-      } else {
-        // Sanitization in place for objects
-        let sanitizedCount = 0;
-        for (const key of Object.keys(input)) {
-          if (typeof input[key] === 'string') {
-            if (detectXSS(input[key])) {
-               input[key] = sanitizeString(input[key]);
-               sanitizedCount++;
-            }
-          } else {
-            sanitizedCount += (processPayload(input[key], key) as number);
+       if (mode === 'block') {
+          return Object.keys(input).some(key => processPayload(input[key], key));
+       } else {
+          let count = 0;
+          for (const key of Object.keys(input)) {
+             const val = input[key];
+             if (typeof val === 'string') {
+                if (DANGEROUS_CHARS.test(val)) {
+                   input[key] = encode(val);
+                   count++;
+                }
+             } else {
+                count += (processPayload(val, key) as number);
+             }
           }
-        }
-        return sanitizedCount;
-      }
+          return count;
+       }
     }
 
-    return false; // Default for numbers, booleans, null
+    return false;
   };
 
   return (req: Request, res: Response, next: NextFunction) => {
     try {
-      const inputs = [
-        { source: 'body', data: req.body },
-        { source: 'query', data: req.query },
-        { source: 'params', data: req.params }
+      // Inputs to check
+      const inputSources = [
+          { name: 'body', data: req.body },
+          { name: 'query', data: req.query },
+          { name: 'params', data: req.params }
       ];
 
-      for (const { source, data } of inputs) {
+      for (const { name, data } of inputSources) {
         if (!data) continue;
 
         if (mode === 'block') {
-          // Block Mode
-          const isMalicious = processPayload(data);
-          if (isMalicious) {
-            const ip = req.ip || req.socket.remoteAddress || 'unknown';
-            logger.warn(`XSS Attempt Blocked`, {
-              ip,
-              path: req.path,
-              source,
-              payload_snippet: JSON.stringify(data).slice(0, 100)
-            });
-
-            return res.status(403).json({
-              status: 'error',
-              code: 'XSS_DETECTED',
-              message: 'Malicious content detected in request.'
-            });
-          }
+           const isMalicious = processPayload(data);
+           if (isMalicious) {
+              logger.warn(`XSS Blocked in ${name}`, { ip: req.ip, path: req.path });
+              return res.status(403).json({
+                 status: 'error',
+                 code: 'SECURITY_VIOLATION',
+                 message: 'Malicious content detected (XSS).'
+              });
+           }
         } else {
-          // Sanitize Mode
-          const changes = processPayload(data) as number;
-          if (changes > 0) {
-             const ip = req.ip || req.socket.remoteAddress || 'unknown';
-             logger.warn(`XSS Content Sanitized (${changes} fields)`, {
-               ip,
-               path: req.path,
-               source
-             });
-          }
+           const sanitizedCount = processPayload(data);
+           if (sanitizedCount) {
+             // We modified req.body/query in place
+             // Just log info
+             logger.info(`XSS Sanitized ${sanitizedCount} fields in ${name}`, { ip: req.ip });
+           }
         }
       }
 
       next();
-    } catch (error) {
-       logger.error('Error in XSS middleware', error);
+    } catch (error: any) {
+       logger.error('XSS Middleware Error', error);
        next();
     }
   };

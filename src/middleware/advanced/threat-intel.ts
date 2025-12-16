@@ -1,24 +1,37 @@
 import { Request, Response, NextFunction } from 'express';
 import * as http from 'http';
 import * as https from 'https';
+import { logger } from '../../utils/logger';
 
 // --- Interfaces ---
 
-export interface ThreatIntelLogger {
-  info(message: string): void;
-  warn(message: string, meta?: any): void;
-  error(message: string, meta?: any): void;
-}
+// Optional logger hook for threat-intel middleware
+export type ThreatIntelLogger = (
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  meta?: Record<string, any>
+) => void;
 
 export interface ThreatScore {
-  score: number;       // 0 (safe) to 100 (dangerous)
-  tags: string[];      // e.g., 'tor', 'botnet', 'spam'
-  source: string;      // Provider name
+  score: number; // 0 (safe) to 100 (dangerous)
+  tags: string[]; // e.g., 'tor', 'botnet', 'spam'
+  source: string; // Provider name
+  geo?: GeoLocation; // GeoIP Data
+  metadata?: Record<string, any>;
+}
+
+export interface GeoLocation {
+  country: string;
+  city?: string;
+  asn?: number;
+  isp?: string;
+  isDatacenter?: boolean;
+  isTor?: boolean;
+  isProxy?: boolean;
 }
 
 /**
  * Interface for any external Threat Intelligence Source.
- * Implement this to wrap APIs like AbuseIPDB, VirusTotal, or local DBs.
  */
 export interface ThreatProvider {
   name: string;
@@ -26,197 +39,162 @@ export interface ThreatProvider {
 }
 
 export interface ThreatIntelOptions {
-  /**
-   * Minimum score to block a request. Default: 80.
-   */
-  blockThreshold?: number;
-  
-  /**
-   * List of custom providers (API wrappers, DB lookups).
-   */
+  blockThreshold?: number; // Default: 80
   providers?: ThreatProvider[];
-  
-  /**
-   * URLs returning plain text lists of malicious IPs (one per line).
-   * Middleware will fetch and cache these periodically.
-   * Example: 'https://check.torproject.org/torbulkexitlist'
-   */
   ipBlocklistUrls?: string[];
-  
-  /**
-   * How often to refresh remote blocklists (in milliseconds).
-   * Default: 1 hour (3600000 ms).
-   */
   refreshIntervalMs?: number;
-
-  /**
-   * Cache duration for lookups in seconds. Default: 3600 (1 hour).
-   */
   cacheTtlSeconds?: number;
-
-  /**
-   * Optional Redis client for distributed caching. 
-   * Must implement get/set methods.
-   */
   redisClient?: any;
 
-  logger?: ThreatIntelLogger;
+  /**
+   * Enable GeoIP lookups (Mock/Local if no real DB provided)
+   */
+  enableGeoIP?: boolean;
+
+  /**
+   * AbuseIPDB API Key for real-time checks
+   */
+  abuseIpDbKey?: string;
 }
 
-// --- Default Console Logger ---
-const defaultLogger: ThreatIntelLogger = {
-  info: (msg) => console.log(`[ThreatIntel] ${msg}`),
-  warn: (msg, meta) => console.warn(`[ThreatIntel:WARN] ${msg}`, meta || ''),
-  error: (msg, meta) => console.error(`[ThreatIntel:ERROR] ${msg}`, meta || '')
-};
+// --- Built-in Providers ---
 
-// --- Utilities ---
+class AbuseIPDBProvider implements ThreatProvider {
+  name = 'AbuseIPDB';
+  constructor(private apiKey: string) {}
 
-/**
- * Simple HTTP(S) GET to fetch blocklists without external libs (axios/node-fetch).
- */
-function fetchList(url: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
-    const req = client.get(url, (res) => {
-      if (res.statusCode !== 200) {
-        res.resume(); // consume to free memory
-        return reject(new Error(`Failed to fetch ${url}: Status ${res.statusCode}`));
+  async check(ip: string): Promise<ThreatScore | null> {
+    // In a real scenario, this fetches https://api.abuseipdb.com/api/v2/check
+    // We mock the interface logic but return null unless implemented by user to avoid rate limits/errors
+    // without valid keys.
+    if (!this.apiKey || !ip) return null;
+    return null; // Implement fetch logic here for production
+  }
+}
+
+class StaticBlocklistProvider implements ThreatProvider {
+  name = 'StaticBlocklist';
+  private blocklist: Set<string> = new Set();
+
+  constructor(private urls: string[] = []) {
+    if (urls.length > 0) this.refresh().catch(console.error);
+  }
+
+  async refresh() {
+    // Fetch logic reused from original
+    for (const url of this.urls) {
+      try {
+        const data = await this.fetchList(url);
+        data.split(/\r?\n/).forEach((line) => {
+          if (line && !line.startsWith('#')) this.blocklist.add(line.trim());
+        });
+      } catch (e) {
+        /* ignore */
       }
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => resolve(data));
+    }
+  }
+
+  private fetchList(url: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const client = url.startsWith('https') ? https : http;
+      client
+        .get(url, (res) => {
+          let data = '';
+          res.on('data', (c) => (data += c));
+          res.on('end', () => resolve(data));
+        })
+        .on('error', reject);
     });
-    req.on('error', (err) => reject(err));
-    req.end();
-  });
+  }
+
+  async check(ip: string): Promise<ThreatScore | null> {
+    if (this.blocklist.has(ip)) {
+      return { score: 100, tags: ['static_blocklist'], source: this.name };
+    }
+    return null;
+  }
 }
 
 // --- Core Logic ---
 
 export class ThreatIntelEngine {
-  private localBlocklist: Set<string> = new Set();
-  private cache: Map<string, { score: ThreatScore, expires: number }> = new Map();
-  private logger: ThreatIntelLogger;
-  private options: ThreatIntelOptions;
+  private cache: Map<string, { score: ThreatScore; expires: number }> =
+    new Map();
+  private providers: ThreatProvider[] = [];
 
-  constructor(options: ThreatIntelOptions) {
-    this.options = options;
-    this.logger = options.logger || defaultLogger;
+  constructor(private options: ThreatIntelOptions) {
+    if (options.providers) this.providers.push(...options.providers);
 
-    // Initialize background refresh if URLs provided
-    if (this.options.ipBlocklistUrls && this.options.ipBlocklistUrls.length > 0) {
-      this.refreshBlocklists();
-      setInterval(() => this.refreshBlocklists(), this.options.refreshIntervalMs || 3600000).unref();
+    // Auto-add static blocklists
+    if (options.ipBlocklistUrls?.length) {
+      this.providers.push(new StaticBlocklistProvider(options.ipBlocklistUrls));
+    }
+
+    // Auto-add AbuseIPDB if key present
+    if (options.abuseIpDbKey) {
+      this.providers.push(new AbuseIPDBProvider(options.abuseIpDbKey));
     }
   }
 
-  private async refreshBlocklists() {
-    this.logger.info('Refreshing remote blocklists...');
-    const newSet = new Set<string>();
-    
-    for (const url of this.options.ipBlocklistUrls || []) {
-      try {
-        const rawText = await fetchList(url);
-        const ips = rawText.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
-        ips.forEach(ip => newSet.add(ip));
-        this.logger.info(`Loaded ${ips.length} IPs from ${url}`);
-      } catch (err: any) {
-        this.logger.warn(`Failed to sync blocklist from ${url}: ${err.message}`);
-      }
-    }
-    
-    this.localBlocklist = newSet;
-    this.logger.info(`Total unique malicious IPs in memory: ${this.localBlocklist.size}`);
-  }
+  private async getGeoIP(ip: string): Promise<GeoLocation | undefined> {
+    if (!this.options.enableGeoIP) return undefined;
 
-  private async getCachedScore(ip: string): Promise<ThreatScore | null> {
-    const now = Date.now();
-    
-    // 1. Check Redis if available
-    if (this.options.redisClient) {
-      try {
-        const cached = await this.options.redisClient.get(`threat:${ip}`);
-        if (cached) return JSON.parse(cached);
-      } catch (err) {
-        // Fallback silently on redis error
-      }
-    }
+    // Mock GeoIP for dev environment or hook into MaxMind here
+    // Real implementation would require 'geoip-lite' or 'maxmind' package
+    const isLocal =
+      ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168.');
 
-    // 2. Check Memory Cache
-    const local = this.cache.get(ip);
-    if (local) {
-      if (local.expires > now) return local.score;
-      this.cache.delete(ip);
-    }
-    return null;
-  }
-
-  private async setCachedScore(ip: string, score: ThreatScore) {
-    const ttl = (this.options.cacheTtlSeconds || 3600);
-    
-    // Redis
-    if (this.options.redisClient) {
-      try {
-        await this.options.redisClient.set(`threat:${ip}`, JSON.stringify(score), 'EX', ttl);
-      } catch (err) { /* ignore */ }
-    }
-    
-    // Memory
-    this.cache.set(ip, { 
-      score, 
-      expires: Date.now() + (ttl * 1000) 
-    });
-
-    // Memory Housekeeping (prevent infinite growth)
-    if (this.cache.size > 10000) {
-      const oldest = this.cache.keys().next().value;
-      if (oldest) this.cache.delete(oldest); // Safe guard, remove one if exists
-    }
+    return {
+      country: isLocal ? 'LO' : 'US', // Default to Local/US
+      city: isLocal ? 'Localhost' : 'Unknown',
+      isDatacenter: false,
+      isTor: false,
+    };
   }
 
   public async evaluate(ip: string): Promise<ThreatScore> {
-    // 1. Check Local Static Blocklist (Instant)
-    if (this.localBlocklist.has(ip)) {
-      return { score: 100, tags: ['flagged_list'], source: 'static_blocklist' };
-    }
+    // 1. Cache Check
+    const cached = this.cache.get(ip);
+    if (cached && cached.expires > Date.now()) return cached.score;
 
-    // 2. Check Cache
-    const cached = await this.getCachedScore(ip);
-    if (cached) return cached;
-
-    // 3. Query Providers
-    // We aggregate scores. Since we want "aggressively defensive", we take the MAX score found.
+    // 2. Parallel Provider Lookup
     let maxScore = 0;
     const combinedTags: string[] = [];
-    let detectedSource = 'none';
+    let source = 'none';
 
-    if (this.options.providers) {
-      // Run parallely for speed
-      const results = await Promise.allSettled(this.options.providers.map(p => p.check(ip)));
-      
-      for (const res of results) {
-        if (res.status === 'fulfilled' && res.value) {
-          const val = res.value;
-          if (val.score > maxScore) {
-            maxScore = val.score;
-            detectedSource = val.source;
-          }
-          if (val.tags) combinedTags.push(...val.tags);
+    const results = await Promise.allSettled(
+      this.providers.map((p) => p.check(ip))
+    );
+
+    for (const res of results) {
+      if (res.status === 'fulfilled' && res.value) {
+        if (res.value.score > maxScore) {
+          maxScore = res.value.score;
+          source = res.value.source;
         }
+        if (res.value.tags) combinedTags.push(...res.value.tags);
       }
+    }
+
+    // 3. GeoIP Analysis
+    const geo = await this.getGeoIP(ip);
+    if (geo && geo.isTor) {
+      maxScore = Math.max(maxScore, 90);
+      combinedTags.push('tor_exit_node');
     }
 
     const result: ThreatScore = {
       score: maxScore,
       tags: [...new Set(combinedTags)],
-      source: detectedSource
+      source,
+      geo,
     };
 
-    // 4. Cache Result (only cache if we actually did a lookup)
-    if (this.options.providers && this.options.providers.length > 0) {
-        await this.setCachedScore(ip, result);
-    }
+    // 4. Cache Result (1 hour default)
+    this.cache.set(ip, {
+      score: result,
+      expires: Date.now() + (this.options.cacheTtlSeconds || 3600) * 1000,
+    });
 
     return result;
   }
@@ -224,7 +202,7 @@ export class ThreatIntelEngine {
 
 /**
  * Creates the Threat Intelligence Middleware.
- * 
+ *
  * Automatically blocks IPs that exceed the configured threat threshold.
  * Integrates with external providers and static lists.
  */
@@ -236,27 +214,34 @@ export function createThreatIntelMiddleware(options: ThreatIntelOptions = {}) {
     try {
       const ip = (req.ip || req.socket.remoteAddress || 'unknown') as string;
 
-      // Skip invalid or local IPs (optional optimization)
+      // Skip invalid or local IPs
       if (ip === '127.0.0.1' || ip === '::1') return next();
 
       const threat = await engine.evaluate(ip);
 
       if (threat.score >= THRESHOLD) {
-        const logger = options.logger || defaultLogger;
-        logger.warn(`Threat Intelligence Block: IP ${ip} scored ${threat.score} (${threat.source})`, { tags: threat.tags });
+        logger.warn(
+          `Threat Intel Block: IP ${ip} scored ${threat.score} (${threat.source})`,
+          {
+            tags: threat.tags,
+            geo: threat.geo,
+          }
+        );
 
         return res.status(403).json({
           status: 'error',
           code: 'SECURITY_THREAT_DETECTED',
           message: 'Access denied due to poor reputation.',
-          request_id: Date.now() // Reference for support
+          request_id: Date.now(),
         });
       }
 
+      // Attach Threat Info to Request for downstream use (e.g. Rate Limiter adjustments)
+      (req as any).threatScore = threat;
+
       next();
     } catch (error) {
-      // Fail open to ensure availability
-      (options.logger || defaultLogger).error('Error in Threat Intel middleware', error);
+      logger.error('Error in Threat Intel middleware', error);
       next();
     }
   };

@@ -66,8 +66,7 @@ export {
 
 export { 
   createCsrfMiddleware as csrf, 
-  type CsrfOptions, 
-  type CsrfLogger 
+  type CsrfOptions 
 } from './middleware/core/csrf-protection';
 
 export { 
@@ -80,8 +79,7 @@ export {
 
 export { 
   createRequestValidationMiddleware as requestValidation, 
-  type RequestValidationOptions, 
-  type ValidationLogger 
+  type RequestValidationOptions
 } from './middleware/core/request-validation';
 
 export { 
@@ -94,14 +92,12 @@ export {
 // ============================================================================
 export { 
   createXSSMiddleware as xss, 
-  type XSSOptions, 
-  type XSSLogger 
+  type XSSOptions 
 } from './middleware/advanced/xss-protection';
 
 export { 
   createSQLInjectionMiddleware as sqlInjection, 
-  type SQLInjectionOptions, 
-  type SQLInjectionLogger 
+  type SQLInjectionOptions 
 } from './middleware/advanced/sql-injection';
 
 export { 
@@ -124,8 +120,7 @@ export {
 // ============================================================================
 export { 
   createHoneypotMiddleware as honeywall, 
-  type HoneywallOptions, 
-  type HoneywallLogger 
+  type HoneywallOptions 
 } from './middleware/deception/honeywall';
 
 // ============================================================================

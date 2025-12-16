@@ -1,17 +1,20 @@
 import { Request, Response, NextFunction } from 'express';
+import * as crypto from 'crypto';
 
 // --- Interfaces ---
 
 export interface HelmetOptions {
   /**
    * Content Security Policy (CSP) options.
-   * Controls which resources the user agent is allowed to load.
    */
-  contentSecurityPolicy?: {
-    useDefaults?: boolean; // If true, adds robust defaults (script-src 'self', etc.)
-    directives?: Record<string, string | string[]>;
-    reportOnly?: boolean;
-  } | boolean;
+  contentSecurityPolicy?:
+    | {
+        useDefaults?: boolean;
+        directives?: Record<string, string | string[]>;
+        reportOnly?: boolean;
+        reportUri?: string;
+      }
+    | boolean;
 
   /**
    * Cross-Origin Embedder Policy (COEP).
@@ -20,16 +23,30 @@ export interface HelmetOptions {
   crossOriginEmbedderPolicy?: boolean | 'require-corp' | 'credentialless';
 
   /**
-   * Cross-Origin Opener Policy (COOP). 
+   * Cross-Origin Opener Policy (COOP).
    * Default: 'same-origin'
    */
-  crossOriginOpenerPolicy?: boolean | 'same-origin' | 'same-origin-allow-popups' | 'unsafe-none';
+  crossOriginOpenerPolicy?:
+    | boolean
+    | 'same-origin'
+    | 'same-origin-allow-popups'
+    | 'unsafe-none';
 
   /**
    * Cross-Origin Resource Policy (CORP).
    * Default: 'same-origin'
    */
-  crossOriginResourcePolicy?: boolean | 'same-origin' | 'same-site' | 'cross-origin';
+  crossOriginResourcePolicy?:
+    | boolean
+    | 'same-origin'
+    | 'same-site'
+    | 'cross-origin';
+
+  /**
+   * Origin-Agent-Cluster.
+   * Default: '?1' (true)
+   */
+  originAgentCluster?: boolean;
 
   /**
    * X-DNS-Prefetch-Control.
@@ -39,22 +56,24 @@ export interface HelmetOptions {
 
   /**
    * X-Frame-Options.
-   * Default: 'SAMEORIGIN'
+   * Default: 'DENY'
    */
   frameguard?: boolean | 'DENY' | 'SAMEORIGIN';
 
   /**
    * Strict-Transport-Security (HSTS).
-   * Default: max-age=15552000; includeSubDomains
+   * Default: max-age=31536000; includeSubDomains; preload
    */
-  hsts?: {
-    maxAge?: number;
-    includeSubDomains?: boolean;
-    preload?: boolean;
-  } | boolean;
+  hsts?:
+    | {
+        maxAge?: number;
+        includeSubDomains?: boolean;
+        preload?: boolean;
+      }
+    | boolean;
 
   /**
-   * X-Download-Options (IE8 specific). 
+   * X-Download-Options (IE8 specific).
    * Default: 'noopen'
    */
   ieNoOpen?: boolean;
@@ -69,107 +88,89 @@ export interface HelmetOptions {
    * X-Permitted-Cross-Domain-Policies.
    * Default: 'none'
    */
-  permittedCrossDomainPolicies?: boolean | 'none' | 'master-only' | 'by-content-type' | 'all';
+  permittedCrossDomainPolicies?:
+    | boolean
+    | 'none'
+    | 'master-only'
+    | 'by-content-type'
+    | 'all';
 
   /**
    * Referrer-Policy.
-   * Default: 'no-referrer'
+   * Default: 'strict-origin-when-cross-origin'
    */
   referrerPolicy?: boolean | string | string[];
 
   /**
    * X-XSS-Protection.
-   * Default: '0' (Disabled in modern browsers, but some legacy apps need '1; mode=block')
+   * Default: '1; mode=block'
    */
   xssFilter?: boolean | '0' | '1' | '1; mode=block';
 
   /**
-   * Permissions-Policy (formerly Feature-Policy).
-   * Dictionary of features to allow/deny. 
-   * e.g., { 'camera': '()', 'geolocation': 'self' }
+   * Permissions-Policy.
+   * Default: geolocation=(), microphone=(), camera=()
    */
   permissionsPolicy?: Record<string, string> | boolean;
+
+  /**
+   * Feature-Policy (Legacy).
+   * Default: synced with Permissions-Policy defaults.
+   */
+  featurePolicy?: Record<string, string> | boolean;
+
+  /**
+   * Server Header Obfuscation.
+   * Default: 'Apache' (Fake) or null to remove.
+   */
+  hidePoweredBy?: boolean | string;
+
+  /**
+   * Cache-Control headers for no-caching (Security best practice for APIs).
+   * Default: true
+   */
+  noCache?: boolean;
 }
 
 /**
  * Enterprise Security Headers Middleware
- * 
- * A zero-dependency, robust implementation of security headers.
+ *
+ * A robust, Zero-Trust implementation of security headers.
  * Protects against XSS, Clickjacking, MIME-sniffing, and ensures SSL enforcement.
- * Includes modern Cross-Origin Isolation headers.
+ * Includes dynamic CSP with Nonce support.
  */
 export function createHelmetMiddleware(options: HelmetOptions = {}) {
-  // --- HSTS Builder ---
-  const getHstsHeader = (): string | null => {
-    if (options.hsts === false) return null;
-    const opts = typeof options.hsts === 'object' ? options.hsts : {};
-    const maxAge = opts.maxAge || 15552000; // 180 days
-    let header = `max-age=${maxAge}`;
-    if (opts.includeSubDomains !== false) header += '; includeSubDomains';
-    if (opts.preload) header += '; preload';
-    return header;
-  };
+  // --- Generators ---
 
-  // --- CSP Builder ---
-  const getCspHeader = (): { name: string, value: string } | null => {
-    if (options.contentSecurityPolicy === false) return null;
-    
-    const opts = typeof options.contentSecurityPolicy === 'object' ? options.contentSecurityPolicy : {};
-    const useDefaults = opts.useDefaults !== false;
-    
-    let directives: Record<string, string[]> = {};
-    
-    if (useDefaults) {
-      directives = {
-        'default-src': ["'self'"],
-        'base-uri': ["'self'"],
-        'font-src': ["'self'", 'https:', 'data:'],
-        'form-action': ["'self'"],
-        'frame-ancestors': ["'self'"],
-        'img-src': ["'self'", 'data:'],
-        'object-src': ["'none'"],
-        'script-src': ["'self'"],
-        'script-src-attr': ["'none'"],
-        'style-src': ["'self'", 'https:', "'unsafe-inline'"],
-        'upgrade-insecure-requests': []
-      };
-    }
-
-    if (opts.directives) {
-      for (const [key, val] of Object.entries(opts.directives)) {
-        directives[key] = Array.isArray(val) ? val : [val];
-      }
-    }
-
-    const value = Object.entries(directives)
-      .map(([key, vals]) => {
-        if (vals.length === 0) return key;
-        return `${key} ${vals.join(' ')}`;
-      })
-      .join('; ');
-
-    const name = opts.reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy';
-    return { name, value };
-  };
-
-  // --- Permissions Policy Builder ---
-  const getPermissionsHeader = (): string | null => {
-    if (options.permissionsPolicy === false) return null;
-    if (typeof options.permissionsPolicy !== 'object') return null; // Default is null unless explicitly set because it varies wildly
-    
-    return Object.entries(options.permissionsPolicy)
-      .map(([feature, allowlist]) => `${feature}=${allowlist}`)
-      .join(', ');
+  const generateNonce = (): string => {
+    return crypto.randomBytes(16).toString('base64');
   };
 
   return (_req: Request, res: Response, next: NextFunction) => {
-    // 1. Strict-Transport-Security
-    const hsts = getHstsHeader();
-    if (hsts) res.setHeader('Strict-Transport-Security', hsts);
+    const nonce = generateNonce();
+    // Expose nonce to views/other middlewares
+    res.locals.nonce = nonce;
+
+    // Inject Traceability Header
+    res.setHeader('X-Request-ID', nonce);
+
+    // 1. Strict-Transport-Security (HSTS)
+    if (options.hsts !== false) {
+      const opts = typeof options.hsts === 'object' ? options.hsts : {};
+      // Enterprise Standard: 1 Year + SubDomains + Preload
+      const maxAge = opts.maxAge || 31536000;
+      let header = `max-age=${maxAge}`;
+      if (opts.includeSubDomains !== false) header += '; includeSubDomains';
+      if (opts.preload !== false) header += '; preload'; // Default to preload for max security
+      res.setHeader('Strict-Transport-Security', header);
+    }
 
     // 2. X-Frame-Options
     if (options.frameguard !== false) {
-      res.setHeader('X-Frame-Options', (options.frameguard as string) || 'SAMEORIGIN');
+      res.setHeader(
+        'X-Frame-Options',
+        (options.frameguard as string) || 'DENY'
+      );
     }
 
     // 3. X-Content-Type-Options
@@ -179,7 +180,10 @@ export function createHelmetMiddleware(options: HelmetOptions = {}) {
 
     // 4. X-DNS-Prefetch-Control
     if (options.dnsPrefetchControl !== false) {
-      res.setHeader('X-DNS-Prefetch-Control', (options.dnsPrefetchControl as string) || 'off');
+      res.setHeader(
+        'X-DNS-Prefetch-Control',
+        (options.dnsPrefetchControl as string) || 'off'
+      );
     }
 
     // 5. X-Download-Options
@@ -189,46 +193,197 @@ export function createHelmetMiddleware(options: HelmetOptions = {}) {
 
     // 6. X-Permitted-Cross-Domain-Policies
     if (options.permittedCrossDomainPolicies !== false) {
-      res.setHeader('X-Permitted-Cross-Domain-Policies', (options.permittedCrossDomainPolicies as string) || 'none');
+      res.setHeader(
+        'X-Permitted-Cross-Domain-Policies',
+        (options.permittedCrossDomainPolicies as string) || 'none'
+      );
     }
 
     // 7. Referrer-Policy
     if (options.referrerPolicy !== false) {
-       const policy = options.referrerPolicy === true ? 'no-referrer' : (options.referrerPolicy || 'no-referrer');
-       res.setHeader('Referrer-Policy', Array.isArray(policy) ? policy.join(',') : policy);
+      let policy = options.referrerPolicy;
+      if (policy === true || policy === undefined || policy === null) {
+        policy = 'strict-origin-when-cross-origin';
+      }
+      const headerVal = Array.isArray(policy)
+        ? policy.join(',')
+        : String(policy);
+      res.setHeader('Referrer-Policy', headerVal);
     }
 
     // 8. X-XSS-Protection
     if (options.xssFilter !== false) {
-      // Modern browsers ignore this, but good for legacy
-      res.setHeader('X-XSS-Protection', (options.xssFilter as string) || '0');
+      res.setHeader(
+        'X-XSS-Protection',
+        (options.xssFilter as string) || '1; mode=block'
+      );
     }
 
-    // 9. Content-Security-Policy
-    const csp = getCspHeader();
-    if (csp) {
-      res.setHeader(csp.name, csp.value);
-    }
-
-    // 10. Cross-Origin Embedder Policy (COEP)
+    // 9. Cross-Origin Embedder Policy (COEP)
     if (options.crossOriginEmbedderPolicy !== false) {
-      res.setHeader('Cross-Origin-Embedder-Policy', (options.crossOriginEmbedderPolicy as string) || 'require-corp');
+      res.setHeader(
+        'Cross-Origin-Embedder-Policy',
+        (options.crossOriginEmbedderPolicy as string) || 'require-corp'
+      );
     }
 
-    // 11. Cross-Origin Opener Policy (COOP)
+    // 10. Cross-Origin Opener Policy (COOP)
     if (options.crossOriginOpenerPolicy !== false) {
-      res.setHeader('Cross-Origin-Opener-Policy', (options.crossOriginOpenerPolicy as string) || 'same-origin');
+      res.setHeader(
+        'Cross-Origin-Opener-Policy',
+        (options.crossOriginOpenerPolicy as string) || 'same-origin'
+      );
     }
 
-    // 12. Cross-Origin Resource Policy (CORP)
+    // 11. Cross-Origin Resource Policy (CORP)
     if (options.crossOriginResourcePolicy !== false) {
-      res.setHeader('Cross-Origin-Resource-Policy', (options.crossOriginResourcePolicy as string) || 'same-origin');
+      res.setHeader(
+        'Cross-Origin-Resource-Policy',
+        (options.crossOriginResourcePolicy as string) || 'same-origin'
+      );
+    }
+
+    // 12. Origin-Agent-Cluster
+    if (options.originAgentCluster !== false) {
+      res.setHeader('Origin-Agent-Cluster', '?1');
     }
 
     // 13. Permissions-Policy
-    if (options.permissionsPolicy) {
-      const pp = getPermissionsHeader();
-      if (pp) res.setHeader('Permissions-Policy', pp);
+    if (options.permissionsPolicy !== false) {
+      const defaults = {
+        geolocation: '()',
+        microphone: '()',
+        camera: '()',
+        payment: '()',
+        usb: '()',
+      };
+
+      const configured =
+        typeof options.permissionsPolicy === 'object'
+          ? options.permissionsPolicy
+          : {};
+      // Merge defaults with config
+      const finalPolicy = { ...defaults, ...configured };
+
+      const headerVal = Object.entries(finalPolicy)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(', ');
+
+      res.setHeader('Permissions-Policy', headerVal);
+    }
+
+    // 14. Feature-Policy (Legacy Support)
+    if (options.featurePolicy !== false) {
+      const defaults = {
+        geolocation: "'none'",
+        microphone: "'none'",
+        camera: "'none'",
+      };
+      const configured =
+        typeof options.featurePolicy === 'object' ? options.featurePolicy : {};
+      const finalPolicy = { ...defaults, ...configured };
+
+      const headerVal = Object.entries(finalPolicy)
+        .map(([k, v]) => `${k} ${v}`)
+        .join('; ');
+
+      res.setHeader('Feature-Policy', headerVal);
+    }
+
+    // 15. Server Obfuscation
+    res.removeHeader('X-Powered-By');
+    if (options.hidePoweredBy !== false) {
+      // Lie about the server to confuse scanners
+      const serverName =
+        typeof options.hidePoweredBy === 'string'
+          ? options.hidePoweredBy
+          : 'Apache';
+      res.setHeader('Server', serverName);
+    }
+
+    // 16. Cache Optimization (No-Cache for security)
+    if (options.noCache !== false) {
+      res.setHeader(
+        'Cache-Control',
+        'no-store, no-cache, must-revalidate, proxy-revalidate'
+      );
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      res.setHeader('Surrogate-Control', 'no-store');
+    }
+
+    // 17. Content-Security-Policy (Dynamic)
+    if (options.contentSecurityPolicy !== false) {
+      const opts =
+        typeof options.contentSecurityPolicy === 'object'
+          ? options.contentSecurityPolicy
+          : {};
+
+      // Defaults: Zero-Trust Strict
+      const baseDirectives: Record<string, string[]> = {
+        'default-src': ["'self'"],
+        'base-uri': ["'self'"],
+        'font-src': ["'self'", 'https:', 'data:'],
+        'form-action': ["'self'"],
+        'frame-ancestors': ["'self'"],
+        'img-src': ["'self'", 'data:'],
+        'object-src': ["'none'"],
+        // Nonce is critical for script safety
+        'script-src': ["'self'", `'nonce-${nonce}'`],
+        'script-src-attr': ["'none'"],
+        'style-src': ["'self'", 'https:', `'nonce-${nonce}'`], // Allow inline styles with nonce too
+        'upgrade-insecure-requests': [],
+      };
+
+      // Merge user directives
+      if (!opts.useDefaults && opts.useDefaults !== undefined) {
+        // If useDefaults is explicitly false, start empty
+        Object.keys(baseDirectives).forEach((k) => delete baseDirectives[k]);
+      }
+
+      const mergedDirectives = { ...baseDirectives };
+
+      if (opts.directives) {
+        Object.entries(opts.directives).forEach(([key, val]) => {
+          const defaults = mergedDirectives[key] || [];
+          const additions = Array.isArray(val) ? val : [val];
+          mergedDirectives[key] = [...new Set([...defaults, ...additions])];
+        });
+      }
+
+      // Add report URI if configured
+      if (opts.reportUri) {
+        mergedDirectives['report-uri'] = [opts.reportUri];
+        mergedDirectives['report-to'] = ['csp-endpoint']; // Modern reporting
+      }
+
+      // Inject any dynamic sources from middleware locals
+      // e.g. res.locals.cspScripts = ['https://trusted.analytics.com']
+      if (res.locals.cspScripts && Array.isArray(res.locals.cspScripts)) {
+        mergedDirectives['script-src'].push(...res.locals.cspScripts);
+      }
+
+      const cspString = Object.entries(mergedDirectives)
+        .map(([key, vals]) => {
+          if (vals.length === 0) return key;
+          return `${key} ${vals.join(' ')}`;
+        })
+        .join('; ');
+
+      const headerName = opts.reportOnly
+        ? 'Content-Security-Policy-Report-Only'
+        : 'Content-Security-Policy';
+      res.setHeader(headerName, cspString);
+
+      // Report-To Header for modern reporting groups
+      if (opts.reportUri) {
+        const reportTo = {
+          group: 'csp-endpoint',
+          max_age: 10886400,
+          endpoints: [{ url: opts.reportUri }],
+        };
+        res.setHeader('Report-To', JSON.stringify(reportTo));
+      }
     }
 
     next();

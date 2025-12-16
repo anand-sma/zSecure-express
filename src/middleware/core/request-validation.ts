@@ -1,12 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
-import { validationResult } from 'express-validator';
+import { validationResult, Result, ValidationError } from 'express-validator';
+import { logger } from '../../utils/logger';
 
 // --- Interfaces ---
-
-export interface ValidationLogger {
-  warn(message: string, meta?: any): void;
-  info(message: string, meta?: any): void;
-}
 
 export interface RequestValidationOptions {
   /**
@@ -29,7 +25,7 @@ export interface RequestValidationOptions {
 
   /**
    * Enforce Content-Type for write methods (POST, PUT, PATCH).
-   * Default: ['application/json', 'model/multipart-form-data', 'application/x-www-form-urlencoded', 'text/plain']
+   * Default: ['application/json', 'multipart/form-data', 'application/x-www-form-urlencoded', 'text/plain']
    */
   allowedContentTypes?: string[];
 
@@ -40,18 +36,17 @@ export interface RequestValidationOptions {
   maxObjectDepth?: number;
 
   /**
+   * Max elements in an array to prevent DoS.
+   * Default: 50
+   */
+  maxArraySize?: number;
+
+  /**
    * Custom validator function (sync or async).
    * If it returns false or throws, request is rejected.
    */
   validator?: (req: Request) => boolean | Promise<boolean>;
-
-  logger?: ValidationLogger;
 }
-
-const defaultLogger: ValidationLogger = {
-  warn: (msg, meta) => console.warn(`[VALIDATION:WARN] ${msg}`, meta || ''),
-  info: (msg) => console.log(`[VALIDATION:INFO] ${msg}`)
-};
 
 /**
  * Enterprise Request Validation & Hygiene Middleware
@@ -62,13 +57,15 @@ const defaultLogger: ValidationLogger = {
  * 3. Checking for Null Byte Injection.
  * 4. Enforcing Content-Type Allowlist.
  * 5. Integrating with express-validator (if used).
+ * 6. Limiting recursion depth and array sizes.
  */
 export function createRequestValidationMiddleware(options: RequestValidationOptions = {}) {
-  const logger = options.logger || defaultLogger;
   const blockProto = options.blockPrototypePollution !== false;
   const blockHpp = options.blockParamPollution !== false;
   const blockNulls = options.blockNullBytes !== false;
   const maxDepth = options.maxObjectDepth || 5;
+  const maxArraySize = options.maxArraySize || 50;
+  
   const allowedTypes = options.allowedContentTypes || [
     'application/json', 
     'multipart/form-data', 
@@ -79,7 +76,8 @@ export function createRequestValidationMiddleware(options: RequestValidationOpti
   // --- Helpers ---
 
   const hasPrototypePollution = (obj: any, depth = 0): boolean => {
-    if (depth > maxDepth || !obj || typeof obj !== 'object') return false;
+    if (!obj || typeof obj !== 'object') return false;
+    if (depth > maxDepth) return false; // Stop recursing, let depth check handle it separately if we wanted, but logic below handles depth.
     
     // Check keys
     for (const key in obj) {
@@ -90,21 +88,29 @@ export function createRequestValidationMiddleware(options: RequestValidationOpti
     return false;
   };
 
+  const checkStructureLimits = (obj: any, depth = 0): { valid: boolean, reason?: string } => {
+     if (depth > maxDepth) return { valid: false, reason: 'Max Depth Exceeded' };
+     
+     if (Array.isArray(obj)) {
+         if (obj.length > maxArraySize) return { valid: false, reason: 'Max Array Size Exceeded' };
+         for (const item of obj) {
+             const res = checkStructureLimits(item, depth + 1);
+             if (!res.valid) return res;
+         }
+     } else if (obj && typeof obj === 'object') {
+         for (const key in obj) {
+             const res = checkStructureLimits(obj[key], depth + 1);
+             if (!res.valid) return res;
+         }
+     }
+     return { valid: true };
+  };
+
   const hasDiffParamPollution = (query: any): boolean => {
-    // Basic HPP Check: check if any value is an array where it shouldn't be? 
-    // Actually, Express parses ?id=1&id=2 as id: ['1', '2']. 
-    // A strict mode might block ALL arrays in query if API doesn't expect them, 
-    // but generic middleware should probably just warn or be configurable.
-    // For now, we'll assume "Duplicate Keys" are suspicious if not explicitly allowed (but difficult to know schema).
-    // Let's stick to a simpler safe-guard: Block if we detect mixed types or massive arrays?
-    // Actually, simple HPP usually involves overwriting a string with an array to crash code expecting string methods.
-    // We will just allow it by default in Express but maybe we can provide a 'strict' mode later.
-    
-    // Re-interpretation: "blockParamPollution" -> Block duplicate keys entirely?
+    // Basic HPP Check: Block duplicates (arrays) in query if strict mode
+    // Express parses ?id=1&id=2 as id: ['1', '2']
     if (!query) return false;
     return Object.values(query).some(val => Array.isArray(val));
-    // NOTE: This blocks ?ids=1&ids=2. This might be too aggressive for some apps. 
-    // But options.blockParamPollution defaults to true, forcing user to opt-out if they use arrays.
   };
 
   const hasNullBytes = (str: unknown): boolean => {
@@ -132,7 +138,20 @@ export function createRequestValidationMiddleware(options: RequestValidationOpti
       }
     }
 
-    // 2. Prototype Pollution Check
+    // 2. Data Structure Limits (DoS Prevention)
+    // Only check body as params/query are usually small strings
+    if (req.body && typeof req.body === 'object') {
+        const structureCheck = checkStructureLimits(req.body);
+        if (!structureCheck.valid) {
+            logger.warn(`DoS Attempt prevented (${structureCheck.reason}) from ${req.ip}`);
+             return res.status(400).json({
+                error: 'Bad Request',
+                message: `Payload too complex (${structureCheck.reason})`
+            });
+        }
+    }
+
+    // 3. Prototype Pollution Check
     if (blockProto) {
       if (hasPrototypePollution(req.body) || hasPrototypePollution(req.query) || hasPrototypePollution(req.params)) {
         logger.warn(`Prototype Pollution attempt detected from ${req.ip}`);
@@ -143,7 +162,7 @@ export function createRequestValidationMiddleware(options: RequestValidationOpti
       }
     }
 
-    // 3. Null Byte Check
+    // 4. Null Byte Check
     if (blockNulls) {
       if (hasNullBytes(req.body) || hasNullBytes(req.query) || hasNullBytes(req.params)) {
         logger.warn(`Null Byte Injection attempt detected from ${req.ip}`);
@@ -154,33 +173,32 @@ export function createRequestValidationMiddleware(options: RequestValidationOpti
       }
     }
 
-    // 4. HTTP Parameter Pollution (Optional Block)
+    // 5. HTTP Parameter Pollution (Optional Block)
     if (blockHpp && hasDiffParamPollution(req.query)) {
-       // Only block if strictly requested, as duplicate params are valid in HTTP (arrays)
-       // But often unsafe in Node apps expecting strings.
        logger.warn(`HTTP Parameter Pollution detected from ${req.ip}`);
+       // Standard Enterprise response: 400 Bad Request
        return res.status(400).json({
          error: 'Bad Request',
          message: 'Duplicate query parameters are not allowed.'
        });
     }
 
-    // 5. Custom Validator
+    // 6. Custom Validator
     if (options.validator) {
       try {
         const isValid = await options.validator(req);
         if (!isValid) {
-          return res.status(400).json({ error: 'Validation Failed' });
+          return res.status(400).json({ error: 'Custom Validation Failed' });
         }
-      } catch (err) {
-        logger.warn(`Custom validation error`, err);
+      } catch (err: any) {
+        logger.warn(`Custom validation error`, { message: err.message });
         return res.status(400).json({ error: 'Validation Error' });
       }
     }
 
-    // 6. Legacy Express-Validator Check
+    // 7. Legacy Express-Validator Check
     // If user put express-validator middleware BEFORE this, we check results here.
-    const errors = validationResult(req);
+    const errors: Result<ValidationError> = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({ 
         status: 'error',

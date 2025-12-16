@@ -1,27 +1,16 @@
 import { Request, Response, NextFunction } from 'express';
+import { logger } from '../../utils/logger';
 
 // ============================================================================
 // Interfaces
 // ============================================================================
 
-export interface AnomalyLogger {
-  log(level: string, message: string): void;
-  warn(message: string): void;
-  error(message: string, meta?: unknown): void;
-}
-
-const defaultLogger: AnomalyLogger = {
-  log: (level, msg) => console.log(`[ANOMALY:${level.toUpperCase()}] ${msg}`),
-  warn: (msg) => console.warn(`[ANOMALY:WARN] ${msg}`),
-  error: (msg, meta) => console.error(`[ANOMALY:ERROR] ${msg}`, meta || '')
-};
-
 export interface AnomalyOptions {
-  threshold?: number;   // Base Z-Score threshold. Default: 3.0 (99.7% confidence deviation)
-  learningRate?: number; // Alpha for EMA (0.0 to 1.0). Default: 0.1 (Slow learning, stable)
+  threshold?: number;   // Base anomaly score threshold (0-100). Default: 80
+  learningRate?: number; // Alpha for EMA (0.0 to 1.0). Default: 0.1
   whitelist?: string[];
   redisClient?: any;
-  logger?: AnomalyLogger;
+  enableNLP?: boolean; // Enable payload analysis
 }
 
 /**
@@ -42,90 +31,139 @@ export interface ClientProfile {
     mean: number;     // Avg content-length
     variance: number;
   };
+
+  pathDepth: {
+    mean: number;
+    variance: number;
+  };
   
   errorRate: number;  // Moving average of 4xx/5xx (0.0 - 1.0)
-  
-  // Anomaly Counter (for persistent blocking)
   violationScore: number;
 }
 
+export interface AnomalyLogger {
+    warn(message: string, meta?: any): void;
+    error(message: string, meta?: any): void;
+    info(message: string, meta?: any): void;
+}
+
 // ============================================================================
-// Statistical Math Engine (Zero Dependency)
+// Statistical Math Engine
 // ============================================================================
 
 const Stats = {
-  /**
-   * Updates an Exponential Moving Average
-   * @param oldMean Current average
-   * @param newValue New data point
-   * @param alpha Learning rate (0 < alpha < 1)
-   */
   updateMean: (oldMean: number, newValue: number, alpha: number): number => {
     return (alpha * newValue) + ((1 - alpha) * oldMean);
   },
 
-  /**
-   * Updates Moving Variance (Welford's algorithm adaptation for EMA)
-   * Var_new = (1-alpha) * (Var_old + alpha * (x - Mean_old)^2)
-   */
   updateVariance: (oldVar: number, oldMean: number, newValue: number, alpha: number): number => {
     const diff = newValue - oldMean;
     return ((1 - alpha) * (oldVar + (alpha * diff * diff)));
   },
 
-  /**
-   * Calculates Z-Score (Standardized Metric)
-   * How many standard deviations is the value away from the mean?
-   */
   calcZScore: (value: number, mean: number, variance: number): number => {
-    // Enforce minimum variance to prevent division by zero AND to handle perfectly stable bots
-    // If variance is 0, any deviation is infinite Z-score. 
-    // We assume a minimum standard deviation of 1ms or 1 byte to be practical.
-    const effectiveVariance = Math.max(variance, 1); 
+    const effectiveVariance = Math.max(variance, 0.1); 
     const stdDev = Math.sqrt(effectiveVariance);
     return Math.abs(value - mean) / stdDev;
+  },
+
+  /**
+   * Simplified Isolation Forest Logic (Outlier Detection)
+   * Scores how "deep" a value is in a random tree. 
+   * Rare values are isolated quickly (short path).
+   * For this stateless version, we approximate "isolation" via deviation from population norms.
+   */
+  calcIsolationScore: (features: number[], norms: number[][]): number => {
+      // features: [interArrival, payloadSize, pathDepth, errorRate]
+      // In a real IF, we'd traverse trees. Here we calculate Mahalanobis-like distance
+      // as a proxy for "how easy it is to isolate this point".
+      let anomalySum = 0;
+      features.forEach((val, idx) => {
+          const [mean, stdDev] = norms[idx]; // [mean, stdDev]
+          if (stdDev > 0) {
+              const z = Math.abs(val - mean) / stdDev;
+              anomalySum += z;
+          }
+      });
+      // Normalize to 0-100 range roughly
+      return Math.min(100, anomalySum * 10);
   }
 };
 
 // ============================================================================
-// State Management
+// NLP Engine (Payload Analysis)
 // ============================================================================
 
-const memoryStore = new Map<string, ClientProfile>();
-const CLEANUP_INTERVAL = 600 * 1000;
+const NLP = {
+    /**
+     * Analyzes text for malicious intent markers (SQLi, XSS, Shell).
+     * Returns a probability score (0-1).
+     */
+    analyzePayload: (text: string): number => {
+        if (!text || text.length < 5) return 0;
+        
+        let score = 0;
+        
+        // 1. Keyword density
+        const keywords = ['select', 'union', 'drop', 'script', 'eval', 'exec', 'system', 'cmd'];
+        const lower = text.toLowerCase();
+        
+        let keywordCount = 0;
+        keywords.forEach(k => { if (lower.includes(k)) keywordCount++; });
+        if (keywordCount > 2) score += 0.4;
 
-// Cleanup timer
-const cleanupTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [key, state] of memoryStore.entries()) {
-    if (now - state.lastSeen > CLEANUP_INTERVAL) {
-      memoryStore.delete(key);
+        // 2. Entropy / Randomness (Obfuscation detection)
+        // High non-alphanumeric ratio often implies obfuscated code or binary data injection
+        const special = (text.match(/[^a-zA-Z0-9\s]/g) || []).length;
+        const ratio = special / text.length;
+        if (ratio > 0.4) score += 0.3;
+
+        // 3. Length outliers (handled by stats, but very long strings are suspicious in short fields)
+        if (text.length > 1000) score += 0.1;
+
+        return Math.min(1, score);
     }
-  }
-}, CLEANUP_INTERVAL);
-
-if (cleanupTimer.unref) cleanupTimer.unref();
+};
 
 // ============================================================================
 // Middleware Implementation
 // ============================================================================
 
-export function createAnomalyDetectionMiddleware(options: AnomalyOptions = {}) {
-  const THRESHOLD = options.threshold || 3.0; // Standard Deviation limit
-  const ALPHA = options.learningRate || 0.1;  // Learning speed
-  const MIN_SAMPLES = 10;                     // Min requests needed before judging
-  const redis = options.redisClient;
-  const logger = options.logger || defaultLogger;
+const memoryStore = new Map<string, ClientProfile>();
+const CLEANUP_INTERVAL = 600 * 1000;
 
-  // --- Store Helpers ---
+// Cleanup
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, state] of memoryStore.entries()) {
+    if (now - state.lastSeen > CLEANUP_INTERVAL) memoryStore.delete(key);
+  }
+}, CLEANUP_INTERVAL).unref();
+
+export function createAnomalyDetectionMiddleware(options: AnomalyOptions = {}) {
+  const BLOCK_THRESHOLD = options.threshold || 80;
+  const ALPHA = options.learningRate || 0.1;
+  const MIN_SAMPLES = 5;
+  const redis = options.redisClient;
+
+  // Global "Population" Norms (Approximated/Hardcoded for now, could be learned)
+  // [Mean, StdDev] for [InterArrival, PayloadSize, PathDepth, ErrorRate]
+  const POPULATION_NORMS = [
+      [2000, 2000], // InterArrival: Expect 2s avg
+      [500, 1000],  // Payload: Expect small
+      [3, 2],       // Path Depth: Expect 3 segments
+      [0.05, 0.2]   // Error Rate: Expect 5%
+  ];
+
   const getProfile = async (ip: string): Promise<ClientProfile> => {
     const now = Date.now();
     const defaultProfile: ClientProfile = {
       firstSeen: now,
       lastSeen: now,
       requestCount: 0,
-      interArrival: { mean: 1000, variance: 0 }, // Init with 1 sec expectation
+      interArrival: { mean: 2000, variance: 0 },
       payload: { mean: 0, variance: 0 },
+      pathDepth: { mean: 2, variance: 0 },
       errorRate: 0,
       violationScore: 0
     };
@@ -143,7 +181,7 @@ export function createAnomalyDetectionMiddleware(options: AnomalyOptions = {}) {
     if (redis) {
       try {
         await redis.set(`ai_anomaly:${ip}`, JSON.stringify(profile), 'EX', 86400);
-      } catch (e) { /* silent fail */ }
+      } catch (e) { /* silent */ }
     } else {
       memoryStore.set(ip, profile);
     }
@@ -156,103 +194,95 @@ export function createAnomalyDetectionMiddleware(options: AnomalyOptions = {}) {
 
       const profile = await getProfile(ip);
       const now = Date.now();
+      
+      // Feature Extraction
       const interArrival = now - profile.lastSeen;
       const payloadSize = parseInt(req.headers['content-length'] || '0', 10);
-
-      // --- 1. INFERENCE PHASE (Judge the request) ---
-      let anomalyScore = 0;
-      let reasons: string[] = [];
-
-      // Only judge if we have enough history (Confidence)
-      if (profile.requestCount > MIN_SAMPLES) {
-        
-        // A. Rhythm Anomaly (Burst Detection)
-        // If they are suddenly 100x faster than their normal
-        const rhythmZ = Stats.calcZScore(interArrival, profile.interArrival.mean, profile.interArrival.variance);
-        
-
-
-        // We only care if they are much FASTER (smaller interArrival) than normal
-        // Z-Score is typically symmetric, but for security, being SLOWER is fine.
-        if (interArrival < profile.interArrival.mean && rhythmZ > THRESHOLD) {
-           anomalyScore += rhythmZ; 
-           reasons.push(`Abnormal Rhythm (Z: ${rhythmZ.toFixed(2)})`);
-        }
-
-        // B. Payload Anomaly
-        // If payload is much LARGER than normal
-        if (payloadSize > 0) {
-            const payloadZ = Stats.calcZScore(payloadSize, profile.payload.mean, profile.payload.variance);
-            if (payloadSize > profile.payload.mean && payloadZ > THRESHOLD) {
-                anomalyScore += (payloadZ * 0.5); // Weighted lower than rhythm
-                reasons.push(`Abnormal Payload (Z: ${payloadZ.toFixed(2)})`);
-            }
-        }
-      }
-
-      // --- 2. LEARNING PHASE (Update the brain) ---
+      const pathDepth = req.path.split('/').filter(Boolean).length;
       
-      // Update Rhythm Model (only if not a complete anomaly, to avoid poisoning the well?)
-      // Actually, we use weighted averages, so anomalies naturally pull the average but slowly.
-      // However, for pure attacks, we might pause learning.
-      if (anomalyScore < (THRESHOLD * 2)) {
-          // Update means first
-          const oldTimeMean = profile.interArrival.mean;
-          profile.interArrival.mean = Stats.updateMean(oldTimeMean, interArrival, ALPHA);
-          profile.interArrival.variance = Stats.updateVariance(profile.interArrival.variance, oldTimeMean, interArrival, ALPHA);
-
-          const oldSizeMean = profile.payload.mean;
-          profile.payload.mean = Stats.updateMean(oldSizeMean, payloadSize, ALPHA);
-          profile.payload.variance = Stats.updateVariance(profile.payload.variance, oldSizeMean, payloadSize, ALPHA);
+      // --- 1. NLP Analysis (Zero-Day Payload Detection) ---
+      let nlpScore = 0;
+      if (options.enableNLP && req.method !== 'GET') {
+          // Check body keys if JSON
+          if (req.body && typeof req.body === 'object') {
+              const bodyStr = JSON.stringify(req.body);
+              nlpScore = NLP.analyzePayload(bodyStr);
+          }
       }
 
-      // Update counters
+      // --- 2. Statistical Inference (Isolation Score) ---
+      let anomalyScore = 0;
+      const reasons: string[] = [];
+
+      if (profile.requestCount > MIN_SAMPLES) {
+          // Feature Vector for this request
+          // Note: Error rate is laggy (previous requests), so we use profile value
+          // We treat interArrival < 100ms as highly suspicious (bot)
+          if (interArrival < 100) anomalyScore += 20;
+
+          // Personal Deviation (Z-Score against Self)
+          const burstZ = Stats.calcZScore(interArrival, profile.interArrival.mean, profile.interArrival.variance);
+          if (burstZ > 3 && interArrival < profile.interArrival.mean) {
+              anomalyScore += 15;
+              reasons.push('Burst Traffic');
+          }
+
+          // Population Deviation (Isolation Outlier)
+          const isoScore = Stats.calcIsolationScore(
+              [interArrival, payloadSize, pathDepth, profile.errorRate],
+              POPULATION_NORMS
+          );
+          
+          anomalyScore += (isoScore * 0.5); // Weighted
+          if (isoScore > 50) reasons.push('Behavioral Outlier');
+          
+          // Add NLP Score (High confidence)
+          if (nlpScore > 0.5) {
+              anomalyScore += (nlpScore * 50);
+              reasons.push('Malicious Payload Pattern');
+          }
+      }
+
+      // --- 3. Learning (Update Profile) ---
+      // Only learn if not blocked, to avoid poisoning model with attack data
+      if (anomalyScore < BLOCK_THRESHOLD) {
+          profile.interArrival.mean = Stats.updateMean(profile.interArrival.mean, interArrival, ALPHA);
+          profile.interArrival.variance = Stats.updateVariance(profile.interArrival.variance, profile.interArrival.mean, interArrival, ALPHA);
+
+          profile.payload.mean = Stats.updateMean(profile.payload.mean, payloadSize, ALPHA);
+          profile.payload.variance = Stats.updateVariance(profile.payload.variance, profile.payload.mean, payloadSize, ALPHA);
+          
+          profile.pathDepth.mean = Stats.updateMean(profile.pathDepth.mean, pathDepth, ALPHA);
+      }
+
       profile.lastSeen = now;
       profile.requestCount++;
 
-      // --- 3. DECISION PHASE ---
-      
-      // Hook into Response to track errors (Post-Request Learning)
-
-      
-      // Note: We can't easily intercept 'write' for status code in all Express versions safely without proxy
-      // Use 'on-headers' or 'finish' event is safer for stats.
+      // Post-Request Learning Hook
       res.on('finish', () => {
-         const isError = res.statusCode >= 400;
-         // Update Error Rate (0 or 1)
-         profile.errorRate = Stats.updateMean(profile.errorRate, isError ? 1 : 0, ALPHA);
-         saveProfile(ip, profile).catch(() => {});
+          const isError = res.statusCode >= 400;
+          profile.errorRate = Stats.updateMean(profile.errorRate, isError ? 1 : 0, ALPHA);
+          saveProfile(ip, profile).catch(() => {});
       });
-
-      // BLOCKING DECISION
-      if (anomalyScore > (THRESHOLD * 1.5)) {
-          profile.violationScore++;
-          logger.warn(`AI Detection: Blocking IP ${ip}. Reasons: ${reasons.join(', ')}`);
+      
+      // --- 4. Decision ---
+      if (anomalyScore >= BLOCK_THRESHOLD) {
+          profile.violationScore += 20;
+          logger.warn(`Anomaly Block: IP ${ip} Score ${anomalyScore.toFixed(0)}`, { reasons });
           
           await saveProfile(ip, profile);
           
-          res.status(403).json({
-              error: 'Traffic Anomaly',
-              message: 'Your request pattern is highly irregular.'
+          return res.status(403).json({
+              error: 'Behavioral Anomaly',
+              message: 'Request blocked by adaptive defense.'
           });
-          return; // Stop execution
       }
 
-      // Warning
-      if (anomalyScore > THRESHOLD) {
-          logger.log('info', `Suspicious activity from ${ip}: ${reasons.join(', ')}`);
-      }
-
-      // Save state before next() to ensure sequential consistency for fast bursts?
-      // In high-concurrency Node, 'await' here might slow things down. 
-      // We rely on 'finish' listener for save usually, but for burst detection, 
-      // we need the updated 'lastSeen' immediately available for the next req.
       await saveProfile(ip, profile);
-      
       next();
 
     } catch (err) {
-      logger.error('Anomaly AI Error', err);
+      logger.error('Anomaly Engine Error', err);
       next();
     }
   };

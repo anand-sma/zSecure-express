@@ -87,18 +87,24 @@ export class SecurityWrapper {
     this.middlewares = [];
 
     // Order matters! Apply in security-best-practice order
+    // Priorities are explicit now, but we add them conditionally
+    
     if (this.config.logging?.audit) this.addAuditLogging();
     if (this.config.cors) this.addCors();
     if (this.config.helmet) this.addHelmet();
     if (this.config.securityHeaders) this.addSecurityHeaders();
+    if (this.config.threatIntel) this.addThreatIntel(); 
+    if (this.config.anomalyDetection) this.addAnomalyDetection();
     if (this.config.rateLimit) this.addRateLimit();
     if (this.config.requestValidation) this.addRequestValidation();
     if (this.config.xss) this.addXSSProtection();
     if (this.config.sqlInjection) this.addSQLInjection();
     if (this.config.csrf) this.addCSRF();
     if (this.config.honeypot) this.addHoneypot();
-    if (this.config.threatIntel) this.addThreatIntel();
-    if (this.config.anomalyDetection) this.addAnomalyDetection();
+
+    // STRICT SORTING BY PRIORITY SCALAR
+    // Lower number = Earlier execution
+    this.middlewares.sort((a, b) => a.priority - b.priority);
   }
 
   private addCors(): void {
@@ -129,7 +135,7 @@ export class SecurityWrapper {
     this.middlewares.push({
       name: 'rateLimit',
       handler: createRateLimitMiddleware(extractOptions(this.config.rateLimit)),
-      priority: 4
+      priority: 5 // After anomalies
     });
   }
 
@@ -137,7 +143,7 @@ export class SecurityWrapper {
     this.middlewares.push({
       name: 'requestValidation',
       handler: createRequestValidationMiddleware(extractOptions(this.config.requestValidation)),
-      priority: 5
+      priority: 6
     });
   }
 
@@ -145,7 +151,7 @@ export class SecurityWrapper {
     this.middlewares.push({
       name: 'xss',
       handler: createXSSMiddleware(extractOptions(this.config.xss)),
-      priority: 6
+      priority: 7
     });
   }
 
@@ -153,7 +159,7 @@ export class SecurityWrapper {
     this.middlewares.push({
       name: 'sqlInjection',
       handler: createSQLInjectionMiddleware(extractOptions(this.config.sqlInjection)),
-      priority: 7
+      priority: 8
     });
   }
 
@@ -161,7 +167,7 @@ export class SecurityWrapper {
     this.middlewares.push({
       name: 'csrf',
       handler: createCsrfMiddleware(extractOptions(this.config.csrf)),
-      priority: 8
+      priority: 9
     });
   }
 
@@ -177,7 +183,7 @@ export class SecurityWrapper {
     this.middlewares.push({
       name: 'threatIntel',
       handler: createThreatIntelMiddleware(extractOptions(this.config.threatIntel)),
-      priority: 60
+      priority: 10 // High
     });
   }
 
@@ -185,7 +191,8 @@ export class SecurityWrapper {
     this.middlewares.push({
       name: 'anomalyDetection',
       handler: createAnomalyDetectionMiddleware(extractOptions(this.config.anomalyDetection)),
-      priority: 70
+      priority: 4 // Detect behaviors before rate limits clamp down hard, or after? 
+                  // Actually, let's put it BEFORE rate limit (Priority 4) so we can catch "slow" scanners that don't trigger rate limit.
     });
   }
 
@@ -196,7 +203,7 @@ export class SecurityWrapper {
         logger.info(`[Audit] ${req.method} ${req.url} - IP: ${req.ip}`);
         next();
       },
-      priority: 0
+      priority: 0 // First
     });
   }
 
@@ -213,7 +220,6 @@ export class SecurityWrapper {
       
       try {
         const result = middleware.handler(req, res, next);
-        // Handle async middlewares
         if (result instanceof Promise) {
           result.catch(reject);
         }
@@ -229,39 +235,50 @@ export class SecurityWrapper {
     res: Response
   ): void {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    logger.error('Security middleware error:', errorMessage);
+    const errorStack = error instanceof Error ? error.stack : undefined;
     
-    // Don't expose internal errors in production
-    const message = process.env.NODE_ENV === 'production'
-      ? 'Security check failed'
-      : errorMessage;
-    
-    res.status(403).json({
-      error: 'Security Violation',
-      message,
-      requestId: req.id,
-      timestamp: new Date().toISOString()
+    // Secure Logging with correlation ID if available
+    logger.error('Security middleware error', { 
+      message: errorMessage, 
+      stack: errorStack, 
+      ip: req.ip, 
+      method: req.method, 
+      path: req.url,
+      
+      requestId: req.id 
     });
+    
+    // Zero Trust Response: Generic, Generic, Generic.
+    // Never leak details.
+    if (!res.headersSent) {
+      res.status(403).json({
+        error: 'Security Exception',
+        message: 'Request denied due to security policy violation.',
+  
+        requestId: req.id,
+        timestamp: new Date().toISOString()
+      });
+    }
   }
 
   private mergeConfig(options: Partial<SecurityConfig>): SecurityConfig {
     const defaults: SecurityConfig = {
       helmet: true,
-      cors: true,
-      rateLimit: true,
+      cors: true,     // Default strict
+      rateLimit: true, // Default strict
       csrf: true,
       xss: true,
       sqlInjection: true,
       requestValidation: true,
       securityHeaders: true,
-      honeypot: false,
-      threatIntel: false,
-      anomalyDetection: false,
+      honeypot: false,       // Default off (can be noisy)
+      threatIntel: true,     // ENABLE Zero Trust by default (empty lists, but active)
+      anomalyDetection: true, // ENABLE Smart security by default
       logging: {
-        level: 'warn',
-        audit: false
+        level: 'info', // Upgraded to info for visibility
+        audit: true    // Audit on by default for Enterprise
       },
-      strictMode: false
+      strictMode: true // Zero Trust Default
     };
 
     return { ...defaults, ...options };
